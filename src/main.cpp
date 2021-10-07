@@ -13,6 +13,10 @@
 #include <FS.h>
 #include <SPIFFS.h>
 #include "AutoConnect.h"
+#include "BLEUtils.h"
+#include "BLEScan.h"
+#include "BLEAdvertisedDevice.h"
+#include "sdkconfig.h"
 
 #define PARAM_FILE      "/keyble.json"
 #define AUX_SETTING_URI "/keyble_setting"
@@ -25,11 +29,13 @@
 #define AP_PSK    "eqivalock"
 #define AP_TITLE  "KeyBLEBridge"
 
-#define MQTT_SUB "/command"
-#define MQTT_PUB "/state"
-#define MQTT_PUB2 "/task"
-#define MQTT_PUB3 "/battery"
-#define MQTT_PUB4 "/rssi"
+#define MQTT_SUB_COMMAND "/KeyBLE/set"
+#define MQTT_SUB_STATE "/KeyBLE/get"
+#define MQTT_PUB_STATE "/KeyBLE/"
+#define MQTT_PUB_LOCK_STATE "/KeyBLE/lock_state"
+#define MQTT_PUB_TASK "/KeyBLE/task"
+#define MQTT_PUB_BATT "/KeyBLE/battery"
+#define MQTT_PUB_RSSI "/KeyBLE/linkquality"
 
 #define CARD_KEY "M001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
@@ -40,7 +46,7 @@ AutoConnect Portal(Server);
 AutoConnectConfig config;
 fs::SPIFFSFS& FlashFS = SPIFFS;
 
-eQ3* keyble;
+eQ3* keyble = NULL;
 
 bool do_open = false;
 bool do_lock = false;
@@ -56,7 +62,10 @@ bool waitForAnswer=false;
 bool KeyBLEConfigured = false;
 unsigned long starttime=0;
 int status = 0;
+bool batteryLow = false;
 int rssi = 0;
+unsigned long previousMillis = 0;
+unsigned long currentMillis = 0;
 
 const int PushButton = 0;
 
@@ -69,13 +78,18 @@ String  MqttTopic;
 String KeyBleMac;
 String KeyBleUserKey;
 String KeyBleUserId;
+String KeyBleRefreshInterval;
 
-String mqtt_sub  = "";
-String mqtt_pub  = "";
-String mqtt_pub2 = "";
-String mqtt_pub3 = "";
-String mqtt_pub4 = "";
+String mqtt_sub_command_value  = "";
+String mqtt_sub_state_value = "";
+String mqtt_pub_state_value  = "";
+String mqtt_pub_lock_state_value = "";
+String mqtt_pub_task_value  = "";
+String mqtt_pub_battery_value = "";
+String mqtt_pub_rssi_value = "";
 
+bool bleDirtyConfig = false;
+bool mqttDirtyConfig = false;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -83,104 +97,150 @@ PubSubClient mqttClient(wifiClient);
 // ---[Add Menue Items]---------------------------------------------------------
 #pragma region
 static const char AUX_keyble_setting[] PROGMEM = R"raw(
-[
-  {
-    "title": "KeyBLE Settings",
-    "uri": "/keyble_setting",
-    "menu": true,
-    "element": [
-      {
-        "name": "style",
-        "type": "ACStyle",
-        "value": "label+input,label+select{position:right;left:120px;width:250px!important;box-sizing:border-box;}"
-      },
-      {
-        "name": "MqttServerName",
-        "type": "ACInput",
-        "value": "",
-        "label": "MQTT Broker IP",
-        "pattern": "^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9])\\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\\-]*[A-Za-z0-9])$",
-        "placeholder": "MQTT broker IP"
-      },
-      {
-        "name": "MqttPort",
-        "type": "ACInput",
-        "label": "MQTT Broker Port"
-      },
-      {
-        "name": "MqttUserName",
-        "type": "ACInput",
-        "label": "MQTT User Name"
-      },
-      {
-        "name": "MqttUserPass",
-        "type": "ACInput",
-        "label": "MQTT User Password",
-        "apply": "password"
-      },
-      {
-        "name": "MqttTopic",
-        "type": "ACInput",
-        "value": "",
-        "label": "MQTT Topic",
-        "pattern": "^([a-zA-Z0-9]([a-zA-Z0-9-])*[a-zA-Z0-9]){1,24}$"
-      },
-      {
-        "name": "KeyBleMac",
-        "type": "ACInput",
-        "label": "KeyBLE MAC"
-      },
-      {
-        "name": "KeyBleUserKey",
-        "type": "ACInput",
-        "label": "KeyBLE User Key"
-      },
-      {
-        "name": "KeyBleUserId",
-        "type": "ACInput",
-        "label": "KeyBLE User ID"
-      },
-      {
-        "name": "save",
-        "type": "ACSubmit",
-        "value": "Save&amp;Start",
-        "uri": "/keyble_save"
-      },
-      {
-        "name": "discard",
-        "type": "ACSubmit",
-        "value": "Discard",
-        "uri": "/_ac"
-      }
-    ]
-  },
-  {
-    "title": "MQTT Settings",
-    "uri": "/keyble_save",
-    "menu": false,
-    "element": [
-      {
-        "name": "caption",
-        "type": "ACText",
-        "value": "<h4>Parameters saved as:</h4>",
-        "style": "text-align:center;color:#2f4f4f;padding:10px;"
-      },
-      {
-        "name": "parameters",
-        "type": "ACText"
-      },
-      {
-        "name": "clear",
-        "type": "ACSubmit",
-        "value": "OK",
-        "uri": "/keyble_setting"
-      }
-    ]
-  }
+[{
+		"title": "KeyBLE Settings",
+		"uri": "/keyble_setting",
+		"menu": true,
+		"element": [{
+				"name": "style",
+				"type": "ACStyle",
+				"value": "label+input,label+select{position:right;left:120px;width:250px!important;box-sizing:border-box;}"
+			},
+			{
+				"name": "MqttServerName",
+				"type": "ACInput",
+				"value": "",
+				"label": "MQTT Broker IP",
+				"pattern": "^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9])\\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\\-]*[A-Za-z0-9])$",
+				"placeholder": "MQTT broker IP"
+			},
+			{
+				"name": "MqttPort",
+				"type": "ACInput",
+				"label": "MQTT Broker Port",
+				"placeholder": "1883",
+				"pattern": "^([0-9]+)$"
+			},
+			{
+				"name": "MqttUserName",
+				"type": "ACInput",
+				"label": "MQTT User Name",
+				"pattern": "^(.*\\S.*)$"
+			},
+			{
+				"name": "MqttUserPass",
+				"type": "ACInput",
+				"label": "MQTT User Password",
+				"apply": "password",
+				"pattern": "^(.*\\S.*)$"
+			},
+			{
+				"name": "MqttTopic",
+				"type": "ACInput",
+				"value": "",
+				"label": "MQTT Topic",
+				"pattern": "^(.*\\S.*)$"
+			},
+			{
+				"name": "KeyBleMac",
+				"type": "ACInput",
+				"label": "KeyBLE MAC",
+				"pattern": "^([0-9A-F]{2}[:]){5}([0-9A-F]{2})$"
+			},
+			{
+				"name": "KeyBleUserKey",
+				"type": "ACInput",
+				"label": "KeyBLE User Key",
+				"pattern": "^(.*\\S.*)$"
+			},
+			{
+				"name": "KeyBleUserId",
+				"type": "ACInput",
+				"label": "KeyBLE User ID",
+				"pattern": "^(.*\\S.*)$"
+			},
+			{
+				"name": "KeyBleRefreshInterval",
+				"type": "ACInput",
+				"label": "KeyBLE refresh interval, minimum is 20000 milliseconds",
+				"pattern": "^([2-9])([0-9]){4}([0-9]*)$",
+				"placeholder": "20000"
+			},
+			{
+				"name": "save",
+				"type": "ACSubmit",
+				"value": "Save&amp;Start",
+				"uri": "/keyble_save"
+			},
+			{
+				"name": "discard",
+				"type": "ACSubmit",
+				"value": "Discard",
+				"uri": "/_ac"
+			}
+		]
+	},
+	{
+		"title": "MQTT Settings",
+		"uri": "/keyble_save",
+		"menu": false,
+		"element": [{
+				"name": "caption",
+				"type": "ACText",
+				"value": "<h4>Parameters saved as:</h4>",
+				"style": "text-align:center;color:#2f4f4f;padding:10px;"
+			},
+			{
+				"name": "parameters",
+				"type": "ACText"
+			},
+			{
+				"name": "clear",
+				"type": "ACSubmit",
+				"value": "OK",
+				"uri": "/keyble_setting"
+			}
+		]
+	}
 ]
 )raw";
 
 #pragma endregion
+
+// ---[SetWifi]-----------------------------------------------------------------
+void SetWifi(bool active) {
+  wifiActive = active;
+  if (active) {
+    WiFi.mode(WIFI_STA);
+    Serial.println("# WiFi enabled");
+  }
+  else {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("# WiFi disabled");
+  }
+}
+// ---[blescan]-----------------------------------------------------------------
+bool blescan(String macAddress) {
+  bool found = false;
+	Serial.println("# Scanning starting");
+	BLEScan* pBLEScan = BLEDevice::getScan();
+	pBLEScan->setActiveScan(true);
+	BLEScanResults scanResults = pBLEScan->start(5);
+	Serial.printf("# Found %d devices\n", scanResults.getCount());
+  String strNames[scanResults.getCount()];
+  for ( int i=0; i<scanResults.getCount(); i++ )
+  {
+    strNames[i] = scanResults.getDevice(i).getAddress().toString().c_str();
+    if (strNames[i] == macAddress)
+    {
+      found = true;
+      Serial.println("# MAC address found!");
+    }
+  }
+	scanResults.dump();
+	Serial.println("# Scanning ended");
+  return found;
+}
 // ---[getParams]---------------------------------------------------------------
 void getParams(AutoConnectAux& aux) {
 
@@ -200,6 +260,9 @@ void getParams(AutoConnectAux& aux) {
   KeyBleUserKey.trim();
   KeyBleUserId = aux["KeyBleUserId"].value;
   KeyBleUserId.trim();
+  KeyBleRefreshInterval = aux["KeyBleRefreshInterval"].value;
+  KeyBleRefreshInterval.trim();
+
  }
 // ---[loadParams]--------------------------------------------------------------
 String loadParams(AutoConnectAux& aux, PageArgument& args) {
@@ -225,166 +288,275 @@ String loadParams(AutoConnectAux& aux, PageArgument& args) {
 // ---[saveParams]--------------------------------------------------------------
 String saveParams(AutoConnectAux& aux, PageArgument& args) {
   AutoConnectAux&   keyble_setting = *Portal.aux(Portal.where());
-  getParams(keyble_setting);
-  AutoConnectInput& mqttserver = keyble_setting["MqttServerName"].as<AutoConnectInput>();
 
-  File param = FlashFS.open(PARAM_FILE, "w");
-  keyble_setting.saveElement(param, { "MqttServerName", "MqttPort", "MqttUserName", "MqttUserPass", "MqttTopic", "KeyBleMac", "KeyBleUserKey", "KeyBleUserId" });
-  param.close();
+  if (keyble_setting.isValid())
+  {
+    File param = FlashFS.open(PARAM_FILE, "w");
+    keyble_setting.saveElement(param, { "MqttServerName", "MqttPort", "MqttUserName", "MqttUserPass", "MqttTopic", "KeyBleMac", "KeyBleUserKey", "KeyBleUserId", "KeyBleRefreshInterval" });
+    param.close();
+    getParams(keyble_setting);
+    KeyBLEConfigured = true;
+  }
+  
+  AutoConnectInput& mqttserver_input = keyble_setting["MqttServerName"].as<AutoConnectInput>();
+  AutoConnectInput& MqttPort_input = keyble_setting["MqttPort"].as<AutoConnectInput>();
+  AutoConnectInput& MqttUserName_input = keyble_setting["MqttUserName"].as<AutoConnectInput>();
+  AutoConnectInput& MqttUserPass_input = keyble_setting["MqttUserPass"].as<AutoConnectInput>();
+  AutoConnectInput& MqttTopic_input = keyble_setting["MqttTopic"].as<AutoConnectInput>();
+  AutoConnectInput& KeyBleMac_input = keyble_setting["KeyBleMac"].as<AutoConnectInput>();
+  AutoConnectInput& KeyBleUserKey_input = keyble_setting["KeyBleUserKey"].as<AutoConnectInput>();
+  AutoConnectInput& KeyBleUserId_input = keyble_setting["KeyBleUserId"].as<AutoConnectInput>();
+  AutoConnectInput& refresh_input = keyble_setting["KeyBleRefreshInterval"].as<AutoConnectInput>();
 
   AutoConnectText&  echo = aux["parameters"].as<AutoConnectText>();
-  echo.value = "Server: " + MqttServerName;
-  echo.value += mqttserver.isValid() ? String(" (OK)") : String(" (ERR)");
-  echo.value += "<br>MQTT Port: " + MqttPort + "<br>";
-  echo.value += "MQTT User Name: " + MqttUserName + "<br>";
-  echo.value += "MQTT User Pass: <hidden><br>";
-  echo.value += "MQTT Topic: " + MqttTopic + "<br>";
-  echo.value += "KeyBLE MAC: " + KeyBleMac + "<br>";
-  echo.value += "KeyBLE User Key: " + KeyBleUserKey + "<br>";
-  echo.value += "KeyBLE User ID: " + KeyBleUserId + "<br>";
+  echo.value = keyble_setting.isValid() ? "Saved!" : "Please correct form errors!";
+  echo.value += "<br><br>Server: " + mqttserver_input.value;
+  echo.value += mqttserver_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>MQTT Port: " + MqttPort_input.value;
+  echo.value += MqttPort_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>MQTT User Name: " + MqttUserName_input.value;
+  echo.value += MqttUserName_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>MQTT User Pass: <hidden>";
+  echo.value += MqttUserPass_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>MQTT Topic: " + MqttTopic_input.value;
+  echo.value += MqttTopic_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>KeyBLE MAC: " + KeyBleMac_input.value;
+  echo.value += KeyBleMac_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>KeyBLE User Key: " + KeyBleUserKey_input.value;
+  echo.value += KeyBleUserKey_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>KeyBLE User ID: " + KeyBleUserId_input.value;
+  echo.value += KeyBleUserId_input.isValid() ? String(" (OK)") : String(" (ERR)");
+  echo.value += "<br>KeyBLE Refresh Interval: " + refresh_input.value;
+  echo.value += refresh_input.isValid() ? String(" (OK)") : String(" (ERR)");
+
+  if (!mqttserver_input.isValid() ||
+      !MqttPort_input.isValid() ||
+      !MqttUserName_input.isValid() ||
+      !MqttUserPass_input.isValid() ||
+      !MqttTopic_input.isValid()
+      ) mqttDirtyConfig = true; else mqttDirtyConfig = false;
+
+  if (!KeyBleMac_input.isValid() || 
+      !KeyBleUserKey_input.isValid() ||
+      !KeyBleUserId_input.isValid() ||
+      !refresh_input.isValid()
+      ) bleDirtyConfig = true; else bleDirtyConfig = false;
 
   return String("");
 }
 // ---[MqttCallback]------------------------------------------------------------
 void MqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("# Message received: ");
+  String topicString = String(topic);
+  String payloadString = String((char*)payload).substring(0, length);
+  // Serial.println("# topic: " + topicString + ", payload: " + payloadString);
+
+  if(topicString.endsWith(MQTT_SUB_COMMAND) == 1)
+  {
+    Serial.println("# Command received");
     /*
-  //pair
-  if (payload[0] == '6')
-  {
-    do_pair = true;
-    mqtt_sub = "*** pair ***";
-    Serial.println(mqtt_sub");
-    
+    //pair
+    if (payloadString == "PAIR")
+    {
+      do_pair = true;
+      mqtt_sub_command_value = "*** pair ***";
+      Serial.println(mqtt_sub_command_value");
+      
+    }
+    */
+    //toggle
+    if (payloadString == "TOGGLE")
+    {
+      do_toggle = true;
+      mqtt_sub_command_value = "*** toggle ***";
+      Serial.println(mqtt_sub_command_value);
+    }
+    //open
+    if (payloadString == "OPEN")
+    {
+      do_open = true;
+      mqtt_sub_command_value = "*** open ***";
+      Serial.println(mqtt_sub_command_value);
+    }
+    //lock  
+    if (payloadString == "LOCK")
+    {
+      do_lock = true;
+      mqtt_sub_command_value = "*** lock ***";
+      Serial.println(mqtt_sub_command_value);
+    }
+    //unlock
+    if (payloadString == "UNLOCK")
+    { 
+      do_unlock = true;
+      mqtt_sub_command_value = "*** unlock ***";
+      Serial.println(mqtt_sub_command_value);
+    }
   }
-  */
-  //toggle
-  if (payload[0] == '5')
+  else if(topicString.endsWith(MQTT_SUB_STATE) == 1)
   {
-    do_toggle = true;
-    mqtt_sub = "*** toggle ***";
-    Serial.println(mqtt_sub);
-  }
-  //open
-  if (payload[0] == '4')
-  {
-    do_open = true;
-    mqtt_sub = "*** open ***";
-    Serial.println(mqtt_sub);
-  }
-  //lock  
-  if (payload[0] == '3')
-  {
-    do_lock = true;
-    mqtt_sub = "*** lock ***";
-    Serial.println(mqtt_sub);
-  }
-  //unlock
-  if (payload[0] == '2')
-  { 
-    do_unlock = true;
-    mqtt_sub = "*** unlock ***";
-    Serial.println(mqtt_sub);
-  }
-  //status
-  if (payload[0] == '1')
-  {
-    do_status = true;
-    mqtt_sub = "*** status ***";
-    Serial.println(mqtt_sub);
+    Serial.println("# Status request received");
+    if (payloadString == "")
+    {
+      do_status = true;
+      mqtt_sub_state_value = "*** status ***";
+      Serial.println(mqtt_sub_state_value);
+    }
   }
 }
 // ---[MQTTpublish]-------------------------------------------------------------
 void MqttPublish()
 {
+  if (keyble == NULL) return;
   statusUpdated = false;
-  //MQTT_PUB status
+  
+  //MQTT_PUB_STATE status
+  batteryLow = (keyble->raw_data[1] == 0x81);
   status = keyble->_LockStatus;
   String str_status="";
-  char charBuffer1[9];
-  if(status == 1)
-   str_status = "moving";
-  else if(status == 2)
-   str_status = "unlocked";
+  char charBufferStatus[9];
+
+  if(status == 2 || status == 4)
+  str_status = "UNLOCKED";
   else if(status == 3)
-   str_status = "locked";
-  else if(status == 4)
-   str_status = "open";
-  else if(status == 9)
-   str_status = "timeout";
+  str_status = "LOCKED";
+  // else if(status == 9)
+  // str_status = "offline";
   else
-   str_status = "unknown";
+  str_status = "";
+  
   String strBuffer =  String(str_status);
-  strBuffer.toCharArray(charBuffer1, 9);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB).c_str()), charBuffer1);
+  strBuffer.toCharArray(charBufferStatus, 9);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_STATE).c_str()), charBufferStatus);
   Serial.print("# published ");
-  Serial.print((String(MqttTopic + MQTT_PUB).c_str()));
+  Serial.print((String(MqttTopic + MQTT_PUB_STATE).c_str()));
   Serial.print("/");
-  Serial.println(charBuffer1);
-  mqtt_pub = charBuffer1;
+  Serial.println(charBufferStatus);
+  mqtt_pub_state_value = charBufferStatus;
 
   delay(100);
 
-  //MQTT_PUB2 task
-  String str_task="waiting";
-  char charBuffer2[8];
-  str_task.toCharArray(charBuffer2, 8);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB2).c_str()), charBuffer2);
+  //MQTT_PUB_LOCK_STATE lock status
+  str_status="";
+  char charBufferLockStatus[11];
+
+  if(status == 1)
+  str_status = "moving";
+  else if(status == 2)
+  str_status = "unlocked";
+  else if(status == 3)
+  str_status = "locked";
+  else if(status == 4)
+  str_status = "opened";
+  else if(status == 9)
+  str_status = "unavailable";
+  else
+  str_status = "unknown";
+
+  String strBufferLockStatus = String(str_status);
+  strBufferLockStatus.toCharArray(charBufferLockStatus, 11);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_LOCK_STATE).c_str()), charBufferLockStatus);
   Serial.print("# published ");
-  Serial.print((String(MqttTopic + MQTT_PUB2).c_str()));
+  Serial.print((String(MqttTopic + MQTT_PUB_LOCK_STATE).c_str()));
   Serial.print("/");
-  Serial.println(charBuffer2);
-  mqtt_pub2 = charBuffer2;
+  Serial.println(charBufferLockStatus);
+  mqtt_pub_lock_state_value = charBufferLockStatus;
+  
+  delay(100);
 
-  //MQTT_PUB3 battery
-  if(keyble->raw_data[1] == 0x81)
-  {  
-    mqttClient.publish((String(MqttTopic + MQTT_PUB3).c_str()), "false");
-    Serial.print("# published ");
-    Serial.print((String(MqttTopic + MQTT_PUB3).c_str()));
-    Serial.print("/");
-    Serial.println("0");
-    mqtt_pub3 = true;
-  }
-  if(keyble->raw_data[1] == 0x01)
-  {  
-    mqttClient.publish((String(MqttTopic + MQTT_PUB3).c_str()), "true");
-    Serial.print("# published ");
-    Serial.print((String(MqttTopic + MQTT_PUB3).c_str()));
-    Serial.print("/");
-    Serial.println("1");
-    mqtt_pub3 = true;
-  }
+  //MQTT_PUB_TASK task
+  String str_task="waiting";
+  char charBufferTask[8];
+  str_task.toCharArray(charBufferTask, 8);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_TASK).c_str()), charBufferTask);
+  Serial.print("# published ");
+  Serial.print((String(MqttTopic + MQTT_PUB_TASK).c_str()));
+  Serial.print("/");
+  Serial.println(charBufferTask);
+  mqtt_pub_task_value = charBufferTask;
 
-  //MQTT_PUB3 rssi
+  //MQTT_PUB_BATT battery
+  String str_batt = "ok";
+  char charBufferBatt[4];
+
+  if(batteryLow)
+  {
+    str_batt = "low";
+  }
+  
+  str_batt.toCharArray(charBufferBatt, 4);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_BATT).c_str()), charBufferBatt);
+  Serial.print("# published ");
+  Serial.print((String(MqttTopic + MQTT_PUB_BATT).c_str()));
+  Serial.print("/");
+  Serial.println("0");
+  mqtt_pub_battery_value = charBufferBatt;
+
+  //MQTT_PUB_RSSI rssi
   rssi = keyble->_RSSI;
-  char charBuffer3[4];
+  char charBufferRssi[4];
   String strRSSI =  String(rssi);
   
-  strRSSI.toCharArray(charBuffer3, 4);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB4).c_str()), charBuffer3);
-  mqtt_pub4 = charBuffer3;
+  strRSSI.toCharArray(charBufferRssi, 4);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_RSSI).c_str()), charBufferRssi);
   Serial.print("# published ");
-  Serial.print((String(MqttTopic + MQTT_PUB4).c_str()));
+  Serial.print((String(MqttTopic + MQTT_PUB_RSSI).c_str()));
   Serial.print("/");
-  Serial.println(charBuffer3);
+  Serial.println(charBufferRssi);
+  mqtt_pub_rssi_value = charBufferRssi;
          
   Serial.println("# waiting for command...");
 }
 // ---[MQTT-Setup]--------------------------------------------------------------
 void SetupMqtt() {
-  while (!mqttClient.connected()) { // Loop until we're reconnected to the MQTT server
-    mqttClient.setServer(MqttServerName.c_str(), MqttPort.toInt());
-    mqttClient.setCallback(&MqttCallback);
-  	Serial.println("# Connect to MQTT-Broker... ");
-    if (mqttClient.connect(MqttTopic.c_str(), MqttUserName.c_str(), MqttUserPass.c_str())) {
-  		Serial.println("# Connected!");
-      mqttClient.subscribe((String(MqttTopic + MQTT_SUB).c_str()));
-  	}
-  	else {
-      Serial.print("!!! error, rc=");
-      Serial.println(mqttClient.state());
+  if (!mqttDirtyConfig)
+  {
+    Serial.println("# Setting up MQTT");
+    while (!mqttClient.connected()) 
+    { // Loop until we're reconnected to the MQTT server
+      mqttClient.setServer(MqttServerName.c_str(), MqttPort.toInt());
+      mqttClient.setCallback(&MqttCallback);
+      Serial.println("# Connect to MQTT-Broker... ");
+      if (mqttClient.connect(MqttTopic.c_str(), MqttUserName.c_str(), MqttUserPass.c_str()))
+      {
+        Serial.println("# Connected!");
+        mqttClient.subscribe((String(MqttTopic + MQTT_SUB_COMMAND).c_str()));
+        Serial.print("# Subscribed to topic: ");
+        Serial.println((String(MqttTopic + MQTT_SUB_COMMAND).c_str()));
+        mqttClient.subscribe((String(MqttTopic + MQTT_SUB_STATE).c_str()));
+        Serial.print("# Subscribed to topic: ");
+        Serial.println((String(MqttTopic + MQTT_SUB_STATE).c_str()));
+        Serial.println("# MQTT Setup done");
+      }
+      else
+      {
+        Serial.print("# MQTT error. Please check configuration, rc=");
+        Serial.println(mqttClient.state());
+        mqttDirtyConfig = true;
+        break;
+      }
     }
+  }
+}
+// ---[Bluetooth-Setup]--------------------------------------------------------------
+void SetupBluetooth() {
+  if (!bleDirtyConfig)
+  {
+    SetWifi(false);
+    Serial.println("# Setting up bluetooth");
+    BLEDevice::init("");
+    Serial.println("# Checking if KeyBle lock is in range");
+    bool keyBleFound = blescan(KeyBleMac);
+    if (keyBleFound)
+    {
+      keyble = new eQ3(KeyBleMac.c_str(), KeyBleUserKey.c_str(), KeyBleUserId.toInt());
+      Serial.println("# Bluetooth Setup done");
+    }
+    else
+    {
+      Serial.println("# KeyBle lock device not found! Please check settings");
+      bleDirtyConfig = true;
+    }
+    SetWifi(true);
   }
 }
 // ---[RootPage]----------------------------------------------------------------
@@ -394,7 +566,7 @@ void rootPage()
    "<html>"
     "<head>"
      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
-  if (mqtt_sub != "\0")
+  if (mqtt_sub_command_value != "\0")
   {
     content +=
     "<meta http-equiv=\"refresh\" content=\"30\"/>";
@@ -434,11 +606,13 @@ void rootPage()
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE MAC Address: " + KeyBleMac + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE User Key: " + KeyBleUserKey + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE User ID: " + KeyBleUserId + "</h2>"
-     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last battery state: " + mqtt_pub3 + "</h2>"
-     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last command received: " + mqtt_sub + "</h2>"
-     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last rssi: " + mqtt_pub4 + "</h2>"
-     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last state: " + mqtt_pub + "</h2>"
-     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last task: " + mqtt_pub2 + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE refresh interval: " + KeyBleRefreshInterval + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last battery state: " + mqtt_pub_battery_value + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last command received: " + mqtt_sub_command_value + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last rssi: " + mqtt_pub_rssi_value + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last state: " + mqtt_pub_state_value + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last lock state: " + mqtt_pub_lock_state_value + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last task: " + mqtt_pub_task_value + "</h2>"
      "<br>"
      "<h2 align=\"center\" style=\"color:blue;margin:20px;\">page refresh every 30 seconds</h2>";
   }
@@ -455,18 +629,6 @@ if (signal > 100)
   return 100;
 else
   return signal;
-}
-// ---[SetWifi]-----------------------------------------------------------------
-void SetWifi(bool active) {
-  wifiActive = active;
-  if (active) {
-    WiFi.mode(WIFI_STA);
-    Serial.println("# WiFi enabled");
-  }
-  else {
-    WiFi.mode(WIFI_OFF);
-    Serial.println("# WiFi disabled");
-  }
 }
 // ---[SetupWiFi]---------------------------------------------------------------
 void SetupWifi()
@@ -522,29 +684,20 @@ void setup() {
 
      Portal.on(AUX_SETTING_URI, loadParams);
      Portal.on(AUX_SAVE_URI, saveParams);
-   }
-   else
-   {
-     Serial.println("load error");
-   }
-   SetupWifi();
-   //Portal.config(config);
-
-  
-  //MQTT
-  if(KeyBLEConfigured)
-  {
-    SetupMqtt();
-    //Bluetooth
-    BLEDevice::init("");
-    keyble = new eQ3(KeyBleMac.c_str(), KeyBleUserKey.c_str(), KeyBleUserId.toInt());
-    //get lockstatus on boot
-    do_status = true;
   }
   else
   {
-    Serial.println("# Please fill in MQTT and KeyBLE credentials first!");
+    Serial.println("load error");
+  }
 
+  SetupWifi();
+
+  if(KeyBLEConfigured)
+  {
+    //MQTT
+    SetupMqtt();
+    //Bluetooth
+    SetupBluetooth();
   }
 }
 // ---[loop]--------------------------------------------------------------------
@@ -559,19 +712,19 @@ pinMode(PushButton, INPUT);
 int Push_button_state = digitalRead(PushButton);
 // if condition checks if push button is pressed
 // if pressed Lock will toggle state
-
 if (Push_button_state == LOW && WiFi.status() == WL_CONNECTED)
 { 
+  Serial.println("# Button pushed... toggling lock!");
   do_toggle = true;
-   
 }
+
 // Wifi reconnect
 if (wifiActive)
 {
   if (WiFi.status() != WL_CONNECTED)
   {
    Serial.println("# WiFi disconnected, reconnect...");
-  SetupWifi();
+   SetupWifi();
   }
   else
   {
@@ -582,36 +735,39 @@ if (wifiActive)
      {
       if(KeyBLEConfigured)
       {
-        Serial.println("# MQTT disconnected, reconnect...");
         SetupMqtt();
         if (statusUpdated)
         {
           MqttPublish();
         }
       }
-      else
-      {
-        Serial.println("# Please fill in MQTT and KeyBLE credentials first!");
-      }
     }
    }
-    else if(mqttClient.connected())
-    {
-      mqttClient.loop();
-    }
+   else if(mqttClient.connected())
+   {
+     mqttClient.loop();
+   }
   }
 }
-if (do_open || do_lock || do_unlock || do_status || do_toggle || do_pair) 
+
+// Bluetooth reconnect
+if (keyble == NULL)
+{
+  SetupBluetooth();
+}
+
+if ((do_open || do_lock || do_unlock || do_status || do_toggle || do_pair) 
+    && keyble != NULL) 
 {
   String str_task="working";
-  char charBuffer4[8];
-  str_task.toCharArray(charBuffer4, 8);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB2).c_str()), charBuffer4);
+  char charBufferTask[8];
+  str_task.toCharArray(charBufferTask, 8);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_TASK).c_str()), charBufferTask);
   Serial.print("# published ");
-  Serial.print((String(MqttTopic + MQTT_PUB2).c_str()));
+  Serial.print((String(MqttTopic + MQTT_PUB_TASK).c_str()));
   Serial.print("/");
-  Serial.println(charBuffer4);
-  mqtt_pub2 = charBuffer4;
+  Serial.println(charBufferTask);
+  mqtt_pub_task_value = charBufferTask;
   delay(200);
   SetWifi(false);
   yield();
@@ -748,5 +904,12 @@ if (do_open || do_lock || do_unlock || do_status || do_toggle || do_pair)
         waitForAnswer=false;
       }
     }
+  }
+
+  currentMillis = millis();
+  if (currentMillis - previousMillis > KeyBleRefreshInterval.toInt())
+  {
+    do_status = true;
+    previousMillis = currentMillis;
   }
 }

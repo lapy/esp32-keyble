@@ -4,6 +4,7 @@
 #include <queue>
 #include <string>
 #include "eQ3.h"
+#include "eQ3_constants.h"
 #include "WiFi.h"
 #include "PubSubClient.h"
 #include <esp_wifi.h>
@@ -13,10 +14,6 @@
 #include <FS.h>
 #include <SPIFFS.h>
 #include "AutoConnect.h"
-#include "BLEUtils.h"
-#include "BLEScan.h"
-#include "BLEAdvertisedDevice.h"
-#include "sdkconfig.h"
 
 #define PARAM_FILE      "/keyble.json"
 #define AUX_SETTING_URI "/keyble_setting"
@@ -31,9 +28,9 @@
 
 #define MQTT_SUB_COMMAND "/KeyBLE/set"
 #define MQTT_SUB_STATE "/KeyBLE/get"
-#define MQTT_PUB_STATE "/KeyBLE/"
+#define MQTT_PUB_STATE "/KeyBLE"
 #define MQTT_PUB_LOCK_STATE "/KeyBLE/lock_state"
-#define MQTT_PUB_TASK "/KeyBLE/task"
+#define MQTT_PUB_AVAILABILITY "/KeyBLE/availability"
 #define MQTT_PUB_BATT "/KeyBLE/battery"
 #define MQTT_PUB_RSSI "/KeyBLE/linkquality"
 
@@ -46,8 +43,9 @@ AutoConnect Portal(Server);
 AutoConnectConfig config;
 fs::SPIFFSFS& FlashFS = SPIFFS;
 
-eQ3* keyble = NULL;
+eQ3* keyble;
 
+unsigned long operationStartTime = 0;
 bool do_open = false;
 bool do_lock = false;
 bool do_unlock = false;
@@ -55,12 +53,11 @@ bool do_status = false;
 bool do_toggle = false;
 bool do_pair = false;
 bool wifiActive = false;
-bool cmdTriggered=false;
-unsigned long timeout=0;
-bool statusUpdated=false;
-bool waitForAnswer=false;
+bool cmdTriggered = false;
+unsigned long timeout = 0;
+bool statusUpdated = false;
+bool waitForAnswer = false;
 bool KeyBLEConfigured = false;
-unsigned long starttime=0;
 int status = 0;
 bool batteryLow = false;
 int rssi = 0;
@@ -80,16 +77,19 @@ String KeyBleUserKey;
 String KeyBleUserId;
 String KeyBleRefreshInterval;
 
+String HomeAssistantMqttPrefix;
+
 String mqtt_sub_command_value  = "";
 String mqtt_sub_state_value = "";
 String mqtt_pub_state_value  = "";
 String mqtt_pub_lock_state_value = "";
-String mqtt_pub_task_value  = "";
+String mqtt_pub_availability_value  = "";
 String mqtt_pub_battery_value = "";
 String mqtt_pub_rssi_value = "";
 
 bool bleDirtyConfig = false;
 bool mqttDirtyConfig = false;
+bool configurationChanged = false;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -162,9 +162,15 @@ static const char AUX_keyble_setting[] PROGMEM = R"raw(
 			{
 				"name": "KeyBleRefreshInterval",
 				"type": "ACInput",
-				"label": "KeyBLE refresh interval, minimum is 20000 milliseconds",
-				"pattern": "^([2-9])([0-9]){4}([0-9]*)$",
+				"label": "KeyBLE refresh interval, minimum is 20000 milliseconds, 0 to disable",
+				"pattern": "^([0])|([2-9])([0-9]){4}([0-9]*)$",
 				"placeholder": "20000"
+			},
+      {
+				"name": "HomeAssistantMqttPrefix",
+				"type": "ACInput",
+				"label": "(Optional) Home Assistant MQTT topic prefix. Fill this if you want the lock to be autodiscovered by Home Assistant",
+				"placeholder": "homeassistant"
 			},
 			{
 				"name": "save",
@@ -219,28 +225,6 @@ void SetWifi(bool active) {
     Serial.println("# WiFi disabled");
   }
 }
-// ---[blescan]-----------------------------------------------------------------
-bool blescan(String macAddress) {
-  bool found = false;
-	Serial.println("# Scanning starting");
-	BLEScan* pBLEScan = BLEDevice::getScan();
-	pBLEScan->setActiveScan(true);
-	BLEScanResults scanResults = pBLEScan->start(5);
-	Serial.printf("# Found %d devices\n", scanResults.getCount());
-  String strNames[scanResults.getCount()];
-  for ( int i=0; i<scanResults.getCount(); i++ )
-  {
-    strNames[i] = scanResults.getDevice(i).getAddress().toString().c_str();
-    if (strNames[i] == macAddress)
-    {
-      found = true;
-      Serial.println("# MAC address found!");
-    }
-  }
-	scanResults.dump();
-	Serial.println("# Scanning ended");
-  return found;
-}
 // ---[getParams]---------------------------------------------------------------
 void getParams(AutoConnectAux& aux) {
 
@@ -262,6 +246,8 @@ void getParams(AutoConnectAux& aux) {
   KeyBleUserId.trim();
   KeyBleRefreshInterval = aux["KeyBleRefreshInterval"].value;
   KeyBleRefreshInterval.trim();
+  HomeAssistantMqttPrefix = aux["HomeAssistantMqttPrefix"].value;
+  HomeAssistantMqttPrefix.trim();
 
  }
 // ---[loadParams]--------------------------------------------------------------
@@ -292,10 +278,11 @@ String saveParams(AutoConnectAux& aux, PageArgument& args) {
   if (keyble_setting.isValid())
   {
     File param = FlashFS.open(PARAM_FILE, "w");
-    keyble_setting.saveElement(param, { "MqttServerName", "MqttPort", "MqttUserName", "MqttUserPass", "MqttTopic", "KeyBleMac", "KeyBleUserKey", "KeyBleUserId", "KeyBleRefreshInterval" });
+    keyble_setting.saveElement(param, { "MqttServerName", "MqttPort", "MqttUserName", "MqttUserPass", "MqttTopic", "KeyBleMac", "KeyBleUserKey", "KeyBleUserId", "KeyBleRefreshInterval", "HomeAssistantMqttPrefix" });
     param.close();
     getParams(keyble_setting);
     KeyBLEConfigured = true;
+    configurationChanged = true;
   }
   
   AutoConnectInput& mqttserver_input = keyble_setting["MqttServerName"].as<AutoConnectInput>();
@@ -328,19 +315,6 @@ String saveParams(AutoConnectAux& aux, PageArgument& args) {
   echo.value += KeyBleUserId_input.isValid() ? String(" (OK)") : String(" (ERR)");
   echo.value += "<br>KeyBLE Refresh Interval: " + refresh_input.value;
   echo.value += refresh_input.isValid() ? String(" (OK)") : String(" (ERR)");
-
-  if (!mqttserver_input.isValid() ||
-      !MqttPort_input.isValid() ||
-      !MqttUserName_input.isValid() ||
-      !MqttUserPass_input.isValid() ||
-      !MqttTopic_input.isValid()
-      ) mqttDirtyConfig = true; else mqttDirtyConfig = false;
-
-  if (!KeyBleMac_input.isValid() || 
-      !KeyBleUserKey_input.isValid() ||
-      !KeyBleUserId_input.isValid() ||
-      !refresh_input.isValid()
-      ) bleDirtyConfig = true; else bleDirtyConfig = false;
 
   return String("");
 }
@@ -406,27 +380,23 @@ void MqttCallback(char* topic, byte* payload, unsigned int length) {
 // ---[MQTTpublish]-------------------------------------------------------------
 void MqttPublish()
 {
-  if (keyble == NULL) return;
+  if (mqttDirtyConfig || bleDirtyConfig) return;
   statusUpdated = false;
   
   //MQTT_PUB_STATE status
   batteryLow = (keyble->raw_data[1] == 0x81);
   status = keyble->_LockStatus;
-  String str_status="";
-  char charBufferStatus[9];
+  String str_status = "unknown";
+  char charBufferStatus[10];
 
-  if(status == 2 || status == 4)
+  if(status == LockStatus::UNLOCKED || status == LockStatus::OPENED)
   str_status = "UNLOCKED";
-  else if(status == 3)
+  else if(status == LockStatus::LOCKED)
   str_status = "LOCKED";
-  // else if(status == 9)
-  // str_status = "offline";
-  else
-  str_status = "";
   
   String strBuffer =  String(str_status);
-  strBuffer.toCharArray(charBufferStatus, 9);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB_STATE).c_str()), charBufferStatus);
+  strBuffer.toCharArray(charBufferStatus, 10);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_STATE).c_str()), charBufferStatus, true);
   Serial.print("# published ");
   Serial.print((String(MqttTopic + MQTT_PUB_STATE).c_str()));
   Serial.print("/");
@@ -436,25 +406,23 @@ void MqttPublish()
   delay(100);
 
   //MQTT_PUB_LOCK_STATE lock status
-  str_status="";
-  char charBufferLockStatus[11];
+  String str_lock_status = "";
+  char charBufferLockStatus[9];
 
-  if(status == 1)
-  str_status = "moving";
-  else if(status == 2)
-  str_status = "unlocked";
-  else if(status == 3)
-  str_status = "locked";
-  else if(status == 4)
-  str_status = "opened";
-  else if(status == 9)
-  str_status = "unavailable";
-  else
-  str_status = "unknown";
+  if(status == LockStatus::MOVING)
+  str_lock_status = "moving";
+  else if(status == LockStatus::UNLOCKED)
+  str_lock_status = "unlocked";
+  else if(status == LockStatus::LOCKED)
+  str_lock_status = "locked";
+  else if(status == LockStatus::OPENED)
+  str_lock_status = "opened";
+  else if(status == LockStatus::UNKNOWN)
+  str_lock_status = "unknown";
 
   String strBufferLockStatus = String(str_status);
-  strBufferLockStatus.toCharArray(charBufferLockStatus, 11);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB_LOCK_STATE).c_str()), charBufferLockStatus);
+  strBufferLockStatus.toCharArray(charBufferLockStatus, 9);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_LOCK_STATE).c_str()), charBufferLockStatus, true);
   Serial.print("# published ");
   Serial.print((String(MqttTopic + MQTT_PUB_LOCK_STATE).c_str()));
   Serial.print("/");
@@ -463,32 +431,26 @@ void MqttPublish()
   
   delay(100);
 
-  //MQTT_PUB_TASK task
-  String str_task="waiting";
-  char charBufferTask[8];
-  str_task.toCharArray(charBufferTask, 8);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB_TASK).c_str()), charBufferTask);
+  //MQTT_PUB_AVAILABILITY availability
+  String str_availability = (status > LockStatus::UNKNOWN) ? "online" : "offline";
+  char charBufferAvailability[8];
+  str_availability.toCharArray(charBufferAvailability, 8);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_AVAILABILITY).c_str()), charBufferAvailability, true);
   Serial.print("# published ");
-  Serial.print((String(MqttTopic + MQTT_PUB_TASK).c_str()));
+  Serial.print((String(MqttTopic + MQTT_PUB_AVAILABILITY).c_str()));
   Serial.print("/");
-  Serial.println(charBufferTask);
-  mqtt_pub_task_value = charBufferTask;
+  Serial.println(charBufferAvailability);
+  mqtt_pub_availability_value = charBufferAvailability;
 
   //MQTT_PUB_BATT battery
-  String str_batt = "ok";
-  char charBufferBatt[4];
-
-  if(batteryLow)
-  {
-    str_batt = "low";
-  }
-  
-  str_batt.toCharArray(charBufferBatt, 4);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB_BATT).c_str()), charBufferBatt);
+  String str_batt = batteryLow ? "true" : "false";
+  char charBufferBatt[6];
+  str_batt.toCharArray(charBufferBatt, 6);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_BATT).c_str()), charBufferBatt, true);
   Serial.print("# published ");
   Serial.print((String(MqttTopic + MQTT_PUB_BATT).c_str()));
   Serial.print("/");
-  Serial.println("0");
+  Serial.println(charBufferBatt);
   mqtt_pub_battery_value = charBufferBatt;
 
   //MQTT_PUB_RSSI rssi
@@ -497,7 +459,7 @@ void MqttPublish()
   String strRSSI =  String(rssi);
   
   strRSSI.toCharArray(charBufferRssi, 4);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB_RSSI).c_str()), charBufferRssi);
+  mqttClient.publish((String(MqttTopic + MQTT_PUB_RSSI).c_str()), charBufferRssi, true);
   Serial.print("# published ");
   Serial.print((String(MqttTopic + MQTT_PUB_RSSI).c_str()));
   Serial.print("/");
@@ -506,58 +468,125 @@ void MqttPublish()
          
   Serial.println("# waiting for command...");
 }
+// ---[HomeAssistant-Setup]--------------------------------------------------------------
+void SetupHomeAssistant() {
+  // Skip if dirty config
+  if (mqttDirtyConfig || HomeAssistantMqttPrefix.isEmpty()) return;
+
+  // Temporarily increase buffer size to send bigger payloads
+  mqttClient.setBufferSize(500);
+
+  Serial.println("# Setting up Home Assistant autodiscovery");
+
+  String lock_conf = "{\"~\":\"" + MqttTopic + "\"," +
+  + "\"name\":\"Eqiva Bluetooth Smart Lock\"," +
+  + "\"device\":{\"identifiers\":[\"keyble_" + KeyBleMac + "\"]," +
+  + "\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\",\"name\":\"Eqiva Bluetooth Smart Lock\" }," +
+  + "\"uniq_id\":\"keyble_" + KeyBleMac + "\"," +
+  + "\"stat_t\":\"~" + MQTT_PUB_STATE + "\"," +
+  + "\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+  + "\"opt\":false," + // optimistic false, wait for actual state update
+  + "\"cmd_t\":\"~" + MQTT_SUB_COMMAND + "\"}";
+
+  Serial.println("# " + HomeAssistantMqttPrefix + "/lock/KeyBLE/config");
+  mqttClient.publish((HomeAssistantMqttPrefix + "/lock/KeyBLE/config").c_str(), lock_conf.c_str(), true);
+
+  String link_quality_conf = "{\"~\":\"" + MqttTopic + "\"," +
+  + "\"name\":\"Eqiva Bluetooth Smart Lock Linkquality\"," +
+  + "\"device\":{\"identifiers\":[\"keyble_" + KeyBleMac + "\"]," +
+  + "\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\",\"name\":\"Eqiva Bluetooth Smart Lock\"}," +
+  + "\"uniq_id\":\"keyble_" + KeyBleMac + "_linkquality\"," +
+  + "\"stat_t\":\"~" + MQTT_PUB_RSSI + "\"," +
+  + "\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+  + "\"icon\":\"mdi:signal\"," +
+  + "\"unit_of_meas\":\"rssi\"}";
+
+  Serial.println("# " + HomeAssistantMqttPrefix + "/sensor/KeyBLE/linkquality/config");
+  mqttClient.publish((HomeAssistantMqttPrefix + "/sensor/KeyBLE/linkquality/config").c_str(), link_quality_conf.c_str(), true);
+
+  String battery_conf = "{\"~\": \"" + MqttTopic + "\"," +
+  + "\"name\":\"Eqiva Bluetooth Smart Lock Battery\"," +
+  + "\"device\":{\"identifiers\":[\"keyble_" + KeyBleMac + "\"]," +
+  + "\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\", \"name\":\"Eqiva Bluetooth Smart Lock\" }," +
+  + "\"uniq_id\":\"keyble_" + KeyBleMac + "_battery\"," +
+  + "\"stat_t\":\"~" + MQTT_PUB_BATT + "\"," +
+  + "\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+  + "\"dev_cla\":\"battery\"}";
+ 
+  Serial.println("# " + HomeAssistantMqttPrefix + "/binary_sensor/KeyBLE/battery/config");
+  mqttClient.publish((HomeAssistantMqttPrefix + "/binary_sensor/KeyBLE/battery/config").c_str(), battery_conf.c_str(), true);
+
+  // Reset buffer size to default
+  mqttClient.setBufferSize(256);
+
+  Serial.println("# Home Assistant autodiscovery configured");
+}
 // ---[MQTT-Setup]--------------------------------------------------------------
 void SetupMqtt() {
-  if (!mqttDirtyConfig)
-  {
-    Serial.println("# Setting up MQTT");
-    while (!mqttClient.connected()) 
-    { // Loop until we're reconnected to the MQTT server
-      mqttClient.setServer(MqttServerName.c_str(), MqttPort.toInt());
-      mqttClient.setCallback(&MqttCallback);
-      Serial.println("# Connect to MQTT-Broker... ");
-      if (mqttClient.connect(MqttTopic.c_str(), MqttUserName.c_str(), MqttUserPass.c_str()))
-      {
-        Serial.println("# Connected!");
-        mqttClient.subscribe((String(MqttTopic + MQTT_SUB_COMMAND).c_str()));
-        Serial.print("# Subscribed to topic: ");
-        Serial.println((String(MqttTopic + MQTT_SUB_COMMAND).c_str()));
-        mqttClient.subscribe((String(MqttTopic + MQTT_SUB_STATE).c_str()));
-        Serial.print("# Subscribed to topic: ");
-        Serial.println((String(MqttTopic + MQTT_SUB_STATE).c_str()));
-        Serial.println("# MQTT Setup done");
-      }
-      else
-      {
-        Serial.print("# MQTT error. Please check configuration, rc=");
-        Serial.println(mqttClient.state());
-        mqttDirtyConfig = true;
-        break;
-      }
+  // Skip if dirty config
+  if (mqttDirtyConfig) return;
+
+  Serial.println("# Setting up MQTT");
+  while (!mqttClient.connected()) 
+  { // Loop until we're reconnected to the MQTT server
+    mqttClient.setServer(MqttServerName.c_str(), MqttPort.toInt());
+    mqttClient.setCallback(&MqttCallback);
+    Serial.println("# Connect to MQTT-Broker... ");
+    if (mqttClient.connect(MqttTopic.c_str(), MqttUserName.c_str(), MqttUserPass.c_str()))
+    {
+      Serial.println("# Connected!");
+      mqttClient.subscribe((String(MqttTopic + MQTT_SUB_COMMAND).c_str()));
+      Serial.print("# Subscribed to topic: ");
+      Serial.println((String(MqttTopic + MQTT_SUB_COMMAND).c_str()));
+      mqttClient.subscribe((String(MqttTopic + MQTT_SUB_STATE).c_str()));
+      Serial.print("# Subscribed to topic: ");
+      Serial.println((String(MqttTopic + MQTT_SUB_STATE).c_str()));
+      Serial.println("# MQTT Setup done");
+      mqttDirtyConfig = false;
+    }
+    else
+    {
+      Serial.print("# MQTT error. Please check configuration, rc=");
+      Serial.println(mqttClient.state());
+      mqttDirtyConfig = true;
+      break;
     }
   }
 }
 // ---[Bluetooth-Setup]--------------------------------------------------------------
 void SetupBluetooth() {
-  if (!bleDirtyConfig)
-  {
-    SetWifi(false);
-    Serial.println("# Setting up bluetooth");
-    BLEDevice::init("");
-    Serial.println("# Checking if KeyBle lock is in range");
-    bool keyBleFound = blescan(KeyBleMac);
-    if (keyBleFound)
-    {
-      keyble = new eQ3(KeyBleMac.c_str(), KeyBleUserKey.c_str(), KeyBleUserId.toInt());
-      Serial.println("# Bluetooth Setup done");
-    }
-    else
-    {
-      Serial.println("# KeyBle lock device not found! Please check settings");
-      bleDirtyConfig = true;
-    }
-    SetWifi(true);
+  // Skip if dirty config
+  if (bleDirtyConfig) return;
+
+  SetWifi(false);
+  Serial.println("# Setting up bluetooth");
+  BLEDevice::init("");
+  Serial.println("# Checking if KeyBle lock is in range");
+  keyble = new eQ3(KeyBleMac.c_str(), KeyBleUserKey.c_str(), KeyBleUserId.toInt());
+  keyble->_LockStatus = LockStatus::UNKNOWN;
+  keyble->updateInfo(); // Trigger status update
+  
+  unsigned int timeout = millis() + 60000; // 60 secs
+  
+  bool is_timeout = false;
+  while (!is_timeout && keyble->_LockStatus == LockStatus::UNKNOWN)
+  {// loop until timeout or lock status updates
+    is_timeout = millis() > timeout;
   }
+
+  if (is_timeout)
+  {
+    Serial.println("# KeyBle lock device not found! Please check settings");
+    bleDirtyConfig = true;
+  }
+  else if (keyble->_LockStatus > LockStatus::UNKNOWN)
+  {
+    Serial.println("# Bluetooth Setup successful");
+    bleDirtyConfig = false;
+  }
+
+  SetWifi(true);
+  
 }
 // ---[RootPage]----------------------------------------------------------------
 void rootPage()
@@ -598,11 +627,18 @@ void rootPage()
   }
   if (KeyBLEConfigured && WiFi.localIP())
   {
+    String mqttConfStatus = (mqttDirtyConfig ? "ERROR" : "OK");
+    String mqttConfStatusColor = (mqttDirtyConfig ? "red" : "green");
+    String bleConfStatus = (bleDirtyConfig ? "ERROR" : "OK");
+    String bleConfStatusColor = (bleDirtyConfig ? "red" : "green");
+
     content +=
+     "<h2 align=\"center\" style=\"color:" + mqttConfStatusColor + ";margin:20px;\">MQTT Configuration: " + mqttConfStatus + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">MQTT Server: " + MqttServerName + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">MQTT Port: " + MqttPort + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">MQTT User Name: " + MqttUserName + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">MQTT Topic: " + MqttTopic + "</h2>"
+     "<h2 align=\"center\" style=\"color:" + bleConfStatusColor + ";margin:20px;\">KeyBLE Configuration: " + bleConfStatus + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE MAC Address: " + KeyBleMac + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE User Key: " + KeyBleUserKey + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE User ID: " + KeyBleUserId + "</h2>"
@@ -612,7 +648,8 @@ void rootPage()
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last rssi: " + mqtt_pub_rssi_value + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last state: " + mqtt_pub_state_value + "</h2>"
      "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last lock state: " + mqtt_pub_lock_state_value + "</h2>"
-     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last task: " + mqtt_pub_task_value + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">KeyBLE last availability: " + mqtt_pub_availability_value + "</h2>"
+     "<h2 align=\"center\" style=\"color:green;margin:20px;\">Home Assistant MQTT Topic Prefix: " + HomeAssistantMqttPrefix + "</h2>"
      "<br>"
      "<h2 align=\"center\" style=\"color:blue;margin:20px;\">page refresh every 30 seconds</h2>";
   }
@@ -696,12 +733,25 @@ void setup() {
   {
     //MQTT
     SetupMqtt();
+    //Home Assistant autodiscovery
+    SetupHomeAssistant();
     //Bluetooth
     SetupBluetooth();
   }
 }
 // ---[loop]--------------------------------------------------------------------
 void loop() {
+
+if(configurationChanged) {
+  mqttDirtyConfig = false;
+  bleDirtyConfig = false;
+
+  SetupMqtt();
+  SetupHomeAssistant();
+  SetupBluetooth();
+
+  configurationChanged = false;
+}
 
 Portal.handleClient();  
 
@@ -750,30 +800,14 @@ if (wifiActive)
   }
 }
 
-// Bluetooth reconnect
-if (keyble == NULL)
+if ((do_open || do_lock || do_unlock || do_status || do_toggle || do_pair) && !bleDirtyConfig) 
 {
-  SetupBluetooth();
-}
-
-if ((do_open || do_lock || do_unlock || do_status || do_toggle || do_pair) 
-    && keyble != NULL) 
-{
-  String str_task="working";
-  char charBufferTask[8];
-  str_task.toCharArray(charBufferTask, 8);
-  mqttClient.publish((String(MqttTopic + MQTT_PUB_TASK).c_str()), charBufferTask);
-  Serial.print("# published ");
-  Serial.print((String(MqttTopic + MQTT_PUB_TASK).c_str()));
-  Serial.print("/");
-  Serial.println(charBufferTask);
-  mqtt_pub_task_value = charBufferTask;
-  delay(200);
+  //delay(200);
   SetWifi(false);
   yield();
   waitForAnswer=true;
-  keyble->_LockStatus = -1;
-  starttime = millis();
+  keyble->_LockStatus = LockStatus::UNKNOWN;
+  operationStartTime = millis();
 
   if (do_open)
   {
@@ -806,18 +840,18 @@ if ((do_open || do_lock || do_unlock || do_status || do_toggle || do_pair)
   if (do_toggle)
   {
     Serial.println("*** toggle ***");
-    if ((status == 2) || (status == 4))
+    if ((status == LockStatus::UNLOCKED) || (status == LockStatus::OPENED))
     {
       keyble->lock();
       do_lock = false;
     }
-    if (status == 3)
+    if (status == LockStatus::LOCKED)
     {
       keyble->unlock();
       do_unlock = false;
     }
     do_toggle = false;
-   }
+  }
    
    if (do_pair)
    {
@@ -855,61 +889,43 @@ if ((do_open || do_lock || do_unlock || do_status || do_toggle || do_pair)
   
   if(waitForAnswer)
   {
-    bool timeout=(millis() - starttime > LOCK_TIMEOUT *2000 +1000);
-    bool finished=false;
+    bool timeout=(millis() - operationStartTime > LOCK_TIMEOUT *2000 +1000);
+    bool finished=(keyble->_LockStatus > LockStatus::MOVING);
 
-    if ((keyble->_LockStatus != -1) || timeout)
+    if (finished || timeout)
     {
-      if(keyble->_LockStatus == 1)
+      if (timeout) Serial.println("# Lock timed out!");
+      
+      do
       {
-        //Serial.println("Lockstatus 1");
-        if(timeout)
-        {
-          finished=true;
-          Serial.println("!!! Lockstatus 1 - timeout !!!");
-        }
-      }
-      else if(keyble->_LockStatus == -1)
-      {
-        //Serial.println("Lockstatus -1");
-        if(timeout)
-        {
-          keyble->_LockStatus = 9; //timeout
-          finished=true;
-          Serial.println("!!! Lockstatus -1 - timeout !!!");
-        }
-      }
-      else if(keyble->_LockStatus != 1)
-      {
-        finished=true;
-        //Serial.println("Lockstatus != 1");
-      }
-
-      if(finished)
-      {
-        Serial.println("# Done!");
-        do
-        {
-          keyble->bleClient->disconnect();
-          delay(100);
-        }
-        while(keyble->state.connectionState != DISCONNECTED && !timeout);
-
+        keyble->bleClient->disconnect();
         delay(100);
-        yield();
-          
-        SetWifi(true);
-        
-        statusUpdated=true;
-        waitForAnswer=false;
+      }
+      while(keyble->state.connectionState != DISCONNECTED && !timeout);
+
+      delay(100);
+      yield();
+      SetWifi(true);
+      
+      statusUpdated=true;
+      waitForAnswer=false;
+      
+      if (KeyBleRefreshInterval != "0")
+      {
+        // reset refresh counter
+        // refresh every 5 seconds if timeout, else normal interval
+        previousMillis = timeout ? millis() - KeyBleRefreshInterval.toInt() + 5000 : millis();
       }
     }
   }
-
-  currentMillis = millis();
-  if (currentMillis - previousMillis > KeyBleRefreshInterval.toInt())
+  //Periodic status refresh logic, executed only if no commands are waiting
+  else if (KeyBleRefreshInterval != "0" && !bleDirtyConfig) 
   {
-    do_status = true;
-    previousMillis = currentMillis;
+    currentMillis = millis();
+    if (currentMillis - previousMillis > KeyBleRefreshInterval.toInt())
+    {
+      do_status = true; //request status update
+      previousMillis = currentMillis; //reset refresh counter
+    }
   }
 }
